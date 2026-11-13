@@ -15,7 +15,14 @@ class JsonContext {
 public:
   static auto create(luato::State &state) -> luato::Result<JsonContext> {
     auto marker = rstd_try(state.create_table());
-    return Ok(JsonContext(rstd::move(marker)));
+    auto object = rstd_try(state.create_table());
+    auto array = rstd_try(state.create_table());
+    rstd_try(object.raw_set(str_key("__mlua_extra_json_kind"_str),
+                            str_value("object"_str)));
+    rstd_try(array.raw_set(str_key("__mlua_extra_json_kind"_str),
+                           str_value("array"_str)));
+    return Ok(
+        JsonContext(rstd::move(marker), rstd::move(object), rstd::move(array)));
   }
   auto is_null(const luato::TableHandle &table) const -> luato::Result<bool> {
     return table.same_object_in_call(null_table_);
@@ -26,9 +33,18 @@ public:
   }
   auto deserialize_options() const &[[clang::lifetimebound]]
   -> luato::DeserializeOptions {
-    return {rstd::addressof(null_table_)};
+    auto options = luato::DeserializeOptions{};
+    options.null_value = rstd::addressof(null_table_);
+    options.object_metatable = rstd::addressof(object_metatable_);
+    options.array_metatable = rstd::addressof(array_metatable_);
+    return options;
   }
   auto deserialize_options() const && -> luato::DeserializeOptions = delete;
+  auto mark_table(luato::TableHandle &table, bool array) const
+      -> luato::Result<empty> {
+    return table.set_metatable_in_call(array ? &array_metatable_
+                                             : &object_metatable_);
+  }
   auto encode(const luato::LuaValue &value, bool strict = false,
               bool canonical = false) const -> luato::Result<String>;
   template <class Source>
@@ -39,9 +55,13 @@ public:
       -> luato::Result<luato::LuaValue>;
 
 private:
-  explicit JsonContext(luato::TableHandle marker)
-      : null_table_(rstd::move(marker)) {}
+  JsonContext(luato::TableHandle marker, luato::TableHandle object,
+              luato::TableHandle array)
+      : null_table_(rstd::move(marker)), object_metatable_(rstd::move(object)),
+        array_metatable_(rstd::move(array)) {}
   luato::TableHandle null_table_;
+  luato::TableHandle object_metatable_;
+  luato::TableHandle array_metatable_;
 };
 template <class E>
 inline auto json_error(E error, ref<str> context) -> luato::Error {
@@ -84,18 +104,6 @@ inline auto escape(ref<str> text, String &out) -> void {
   }
   result.push(u8(static_cast<unsigned char>('"')));
   out.push_str(String::from_utf8_unchecked(rstd::move(result)).as_str());
-}
-template <class Source>
-inline auto mark_table(Source &frame, luato::TableHandle &table, bool array)
-    -> rstd::Result<empty, luato::Error> {
-  auto meta = new_table(frame);
-  if (meta.is_err())
-    return Err(rstd::move(meta).unwrap_err());
-  auto set = meta->set_in_call(str_key("__mlua_extra_json_kind"_str),
-                               str_value(array ? "array"_str : "object"_str));
-  if (set.is_err())
-    return Err(rstd::move(set).unwrap_err());
-  return table.set_metatable_in_call(&*meta);
 }
 inline auto table_kind(luato::TableHandle &table)
     -> rstd::Result<Option<String>, luato::Error> {
@@ -291,7 +299,7 @@ inline auto decode_json_value(const JsonContext &context, Source &frame,
   if (table.is_err())
     return Err(rstd::move(table).unwrap_err());
   auto handle = rstd::move(table).unwrap();
-  auto marked = mark_table(frame, handle, value.is_Array());
+  auto marked = context.mark_table(handle, value.is_Array());
   if (marked.is_err())
     return Err(rstd::move(marked).unwrap_err());
   if (value.is_Array()) {
@@ -382,15 +390,15 @@ inline auto strict_kind(Rc<JsonContext> context, luato::CallFrame &frame)
     frame.push_nil();
   return Ok(usize(1));
 }
-inline auto strict_mark(Rc<JsonContext>, luato::CallFrame &frame, bool array)
-    -> luato::BindingResult {
+inline auto strict_mark(Rc<JsonContext> context, luato::CallFrame &frame,
+                        bool array) -> luato::BindingResult {
   auto value = take(frame, usize());
   if (value.is_err())
     return Err(rstd::move(value).unwrap_err());
   if (!value->is_Table())
     return Err(fail("json kind expects a table"_str));
   auto table = rstd::move(*value).as_Table().value;
-  auto marked = mark_table(frame, table, array);
+  auto marked = context->mark_table(table, array);
   if (marked.is_err())
     return Err(rstd::move(marked).unwrap_err());
   frame.return_value(luato::OpaqueHandle{

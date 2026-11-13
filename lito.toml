@@ -18,7 +18,7 @@ licrypto = { version = "0.2.1", features = ["openssl"] }
 
 [[test]]
 name = "luato-extra-tests"
-sources = ["tests/main.cpp", "tests/tools.cpp", "tests/http.cpp"]
+sources = ["tests/main.cpp", "tests/tools.cpp", "tests/http.cpp", "tests/json_serde.cpp"]
 
 [profile.base]
 exceptions = false
