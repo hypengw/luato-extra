@@ -1,0 +1,28 @@
+[package]
+name = "luato-extra"
+version = "0.1.0"
+standard = "c++23"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "luato-extra"
+module = "luato.extra"
+archive = "luato_extra"
+
+[dependencies]
+luato = { version = "0.1.1", pub = true }
+rstd-std = { version = "0.1.12", pub = true }
+rstd-json = { version = "0.1.12", pub = true }
+lihttpto = { version = "0.1.3", pub = true }
+licrypto = { version = "0.2.1", features = ["openssl"] }
+
+[[test]]
+name = "luato-extra-tests"
+sources = ["tests/main.cpp", "tests/tools.cpp", "tests/http.cpp"]
+
+[profile.base]
+exceptions = false
+rtti = false
+
+[dev-dependencies]
+rstd-test = { version = "0.1.12" }
