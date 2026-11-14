@@ -149,18 +149,96 @@ assert(not pcall(U.append_api_path, 'https://example.com', '//other'))
   ASSERT_TRUE(result.is_ok());
 }
 
-TEST(LuatoExtraTools, PreservesTimeMillisecondsAndRandomBounds) {
+TEST(LuatoExtraTools, TimePreservesMillisecondsAndUtcOffsets) {
   auto state = tools_tests::state();
   auto installed = luato::extra::install_utilities(state, "tools"_str).unwrap();
   auto result = state.execute_entry(tools_tests::source(R"(
-local T, R = tools.time, tools.random
+local T = tools.time
 assert(T.parse_rfc3339('1970-01-01T00:00:00Z') == 0)
 assert(T.parse_rfc3339('1970-01-01T01:00:00.123456+01:00') == 123)
 assert(T.parse_rfc3339('1969-12-31 23:59:59.999z') == -1)
 assert(T.parse_rfc3339('1970-01-01t00:00:00-01:00') == 3600000)
-assert(not pcall(T.parse_rfc3339, '1970-13-01T00:00:00Z'))
-assert(not pcall(T.parse_rfc3339, '1970-01-01T00:00:00'))
+assert(T.parse_rfc3339('1970-01-01T00:00:00+23:59') == -86340000)
+assert(T.parse_rfc3339('1970-01-01T00:00:00-23:59') == 86340000)
+local minus = string.char(0xe2, 0x88, 0x92)
+assert(T.parse_rfc3339('1970-01-01T00:00:00'..minus..'01:00') == 3600000)
 assert(type(T.now()) == 'number' and T.now() > 0)
+)"_str));
+  ASSERT_TRUE(result.is_ok());
+}
+
+TEST(LuatoExtraTools, TimeValidatesCalendarAndUtcOffset) {
+  auto state = tools_tests::state();
+  auto installed = luato::extra::install_utilities(state, "tools"_str).unwrap();
+  auto result = state.execute_entry(tools_tests::source(R"(
+local parse = tools.time.parse_rfc3339
+assert(parse('2000-02-29T00:00:00Z') == 951782400000)
+assert(parse('2024-02-29T00:00:00Z') == 1709164800000)
+for _, text in ipairs{
+    '1900-02-29T00:00:00Z', '2023-02-29T00:00:00Z',
+    '2024-04-31T00:00:00Z', '1970-00-01T00:00:00Z',
+    '1970-13-01T00:00:00Z', '1970-01-00T00:00:00Z',
+    '1970-01-32T00:00:00Z', '1970-01-01T24:00:00Z',
+    '1970-01-01T00:60:00Z', '1970-01-01T00:00:61Z',
+    '1970-01-01T00:00:00+24:00', '1970-01-01T00:00:00-24:00',
+    '1970-01-01T00:00:00+00:60', '1970-01-01T00:00:00-00:60'
+} do
+    assert(not pcall(parse, text), text)
+end
+)"_str));
+  ASSERT_TRUE(result.is_ok());
+}
+
+TEST(LuatoExtraTools, TimeTruncatesNanosecondsAndPreservesLeapSeconds) {
+  auto state = tools_tests::state();
+  auto installed = luato::extra::install_utilities(state, "tools"_str).unwrap();
+  auto result = state.execute_entry(tools_tests::source(R"(
+local parse = tools.time.parse_rfc3339
+assert(parse('1970-01-01T00:00:00.000999999Z') == 0)
+assert(parse('1970-01-01T00:00:00.001000001Z') == 1)
+assert(parse('1970-01-01T00:00:00.123456789999Z') == 123)
+assert(parse('1969-12-31T23:59:59.000999999Z') == -1000)
+assert(parse('1969-12-31T23:59:59.999999999Z') == -1)
+assert(parse('1970-01-01T00:00:60.123456789Z') == 60123)
+assert(parse('1969-12-31T23:59:60.123456789Z') == 123)
+assert(parse('2016-12-31T23:59:60.999999999Z') == 1483228800999)
+)"_str));
+  ASSERT_TRUE(result.is_ok());
+}
+
+TEST(LuatoExtraTools, TimeRejectsMalformedInputWithBindingErrors) {
+  auto state = tools_tests::state();
+  auto installed = luato::extra::install_utilities(state, "tools"_str).unwrap();
+  auto result = state.execute_entry(tools_tests::source(R"(
+local parse = tools.time.parse_rfc3339
+for _, text in ipairs{
+    '', 'not a date', '1970-01-01T00:00:00',
+    '1970-01-01T00:00:00.Z', '1970-01-01T00:00:00.+01:00',
+    '1970-01-01T00:00:00+0100', '1970-01-01T00:00:00+01',
+    '1970-01-01T00:00:00Z ', ' 1970-01-01T00:00:00Z',
+    '1970-01-01T00:00:00+01 :00', '1970-01-01T00:00:00+01: 00',
+    '1970-01-01T00:00:00Z'..string.char(0)..'tail'
+} do
+    local ok, err = pcall(parse, text)
+    assert(not ok and err ~= nil,
+        string.format('%q ok=%s error=%s', text, tostring(ok), tostring(err)))
+end
+assert(not pcall(parse, nil) and not pcall(parse, 0))
+assert(not pcall(parse, {}) and not pcall(parse, string.char(255)))
+)"_str));
+  ASSERT_TRUE(result.is_ok());
+  auto failure = state.execute_entry(
+      tools_tests::source("return tools.time.parse_rfc3339('')"_str));
+  ASSERT_TRUE(failure.is_err());
+  EXPECT_TRUE(failure.as_ref().unwrap_err().message.as_str().contains(
+      "invalid RFC3339 timestamp"_str));
+}
+
+TEST(LuatoExtraTools, PreservesRandomBounds) {
+  auto state = tools_tests::state();
+  auto installed = luato::extra::install_utilities(state, "tools"_str).unwrap();
+  auto result = state.execute_entry(tools_tests::source(R"(
+local R = tools.random
 assert(R.hex(0) == '')
 assert(#R.hex(256) == 512 and R.hex(16):match('^[0-9a-f]+$'))
 assert(not pcall(R.hex, -1) and not pcall(R.hex, 257))
