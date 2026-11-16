@@ -7,6 +7,7 @@ export import rstd.json;
 export import :value;
 using alloc::rc::Rc;
 using rstd::tuple;
+using rstd::collections::BTreeSet;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
@@ -15,8 +16,8 @@ class JsonContext {
 public:
   static auto create(luato::State &state) -> luato::Result<JsonContext> {
     auto marker = rstd_try(state.create_table());
-    auto object = rstd_try(state.create_table());
-    auto array = rstd_try(state.create_table());
+    auto object = rstd_try(state.create_table({.records = usize(1)}));
+    auto array = rstd_try(state.create_table({.records = usize(1)}));
     rstd_try(object.raw_set(str_key("__mlua_extra_json_kind"_str),
                             str_value("object"_str)));
     rstd_try(array.raw_set(str_key("__mlua_extra_json_kind"_str),
@@ -295,7 +296,11 @@ inline auto decode_json_value(const JsonContext &context, Source &frame,
     auto text = value.as_str().unwrap();
     return Ok(str_value(text));
   }
-  auto table = new_table(frame);
+  auto capacity =
+      value.is_Array()
+          ? luato::TableCapacity{.sequence = value.as_array().unwrap()->len()}
+          : luato::TableCapacity{.records = value.as_object().unwrap()->len()};
+  auto table = new_table(frame, capacity);
   if (table.is_err())
     return Err(rstd::move(table).unwrap_err());
   auto handle = rstd::move(table).unwrap();
@@ -328,6 +333,79 @@ inline auto decode_json_value(const JsonContext &context, Source &frame,
   return Ok(luato::LuaValue::Table(rstd::move(handle)));
 }
 
+template <class Source>
+inline auto decode_json_reader(const JsonContext &context, Source &source,
+                               rstd::json::Reader &reader, usize depth,
+                               bool null_as_nil)
+    -> luato::Result<luato::LuaValue> {
+  if (depth > usize(64))
+    return Err(fail("JSON nesting is too deep"_str));
+  auto syntax = [](auto error) {
+    return json_error(rstd::move(error), "invalid JSON"_str);
+  };
+  auto kind = rstd_try(reader.value_kind(), syntax(rstd::move(_e)));
+  switch (kind) {
+  case rstd::json::ValueKind::Null:
+    rstd_try(reader.parse_null(), syntax(rstd::move(_e)));
+    return null_as_nil
+               ? luato::Result<luato::LuaValue>(Ok(luato::LuaValue::Nil()))
+               : context.null_value();
+  case rstd::json::ValueKind::Boolean:
+    return Ok(luato::LuaValue::Boolean(
+        rstd_try(reader.parse_bool(), syntax(rstd::move(_e)))));
+  case rstd::json::ValueKind::Number: {
+    auto number = rstd_try(reader.parse_number(), syntax(rstd::move(_e)));
+    if (auto integer = number.as_i64(); integer.is_some())
+      return Ok(luato::LuaValue::Integer(*integer));
+    return Ok(luato::LuaValue::Number(*number.as_f64()));
+  }
+  case rstd::json::ValueKind::String: {
+    auto text = rstd_try(reader.parse_string(), syntax(rstd::move(_e)));
+    return Ok(luato::LuaValue::Bytes(rstd::move(text).into_bytes()));
+  }
+  case rstd::json::ValueKind::Array: {
+    rstd_try(reader.begin_array(), syntax(rstd::move(_e)));
+    auto table = rstd_try(new_table(source));
+    rstd_try(context.mark_table(table, true));
+    bool first = true;
+    usize index{};
+    while (rstd_try(reader.next_array(first), syntax(rstd::move(_e)))) {
+      auto value = rstd_try(decode_json_reader(context, source, reader,
+                                               depth + usize(1), null_as_nil));
+      ++index;
+      rstd_try(
+          table.set_in_call(luato::LuaValue::Integer(i64(
+                                static_cast<long long>(index.to_primitive()))),
+                            value));
+    }
+    return Ok(luato::LuaValue::Table(rstd::move(table)));
+  }
+  case rstd::json::ValueKind::Object: {
+    rstd_try(reader.begin_object(), syntax(rstd::move(_e)));
+    auto table = rstd_try(new_table(source));
+    rstd_try(context.mark_table(table, false));
+    BTreeSet<String> seen;
+    bool first = true;
+    for (;;) {
+      auto next =
+          rstd_try(reader.next_object_key(first), syntax(rstd::move(_e)));
+      if (next.is_none())
+        return Ok(luato::LuaValue::Table(rstd::move(table)));
+      auto name = rstd::move(next).unwrap();
+      auto value = rstd_try(decode_json_reader(context, source, reader,
+                                               depth + usize(1), null_as_nil));
+      if (reader.reject_duplicate_keys()) {
+        if (seen.contains(name.as_str()))
+          return Err(syntax(reader.duplicate_key_error()));
+        seen.insert(name.clone());
+      }
+      rstd_try(table.set_in_call(
+          luato::LuaValue::Bytes(rstd::move(name).into_bytes()), value));
+    }
+  }
+  }
+}
+
 inline auto json_encode(const JsonContext &context, luato::CallFrame &frame)
     -> rstd::Result<String, luato::Error> {
   auto value = take(frame, usize());
@@ -352,10 +430,11 @@ template <class Source>
 inline auto JsonContext::decode(Source &source, ref<str> text,
                                 bool null_as_nil) const
     -> luato::Result<luato::LuaValue> {
-  auto parsed = rstd_try(rstd::json::from_str(text), [](auto error) {
-    return json_error(rstd::move(error), "invalid JSON"_str);
-  });
-  return decode(source, parsed, null_as_nil);
+  auto reader = rstd::json::Reader(text);
+  auto value =
+      rstd_try(decode_json_reader(*this, source, reader, usize(), null_as_nil));
+  rstd_try(reader.finish(), json_error(rstd::move(_e), "invalid JSON"_str));
+  return Ok(rstd::move(value));
 }
 inline auto strict_encode(Rc<JsonContext> context, luato::CallFrame &frame,
                           bool canonical) -> luato::BindingResult {

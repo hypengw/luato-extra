@@ -27,22 +27,16 @@ inline auto string_arg(luato::CallFrame &frame, usize index)
     return Err(luato::Error::make(luato::ErrorKind::Type, String::make(),
                                   String::make("expected a string"_str))
                    .with_cause(rstd::move(text).unwrap_err()));
-  return Ok(String::make(*text));
+  return Ok(String::from_utf8_unchecked(rstd::move(value->as_Bytes().value)));
 }
-inline auto new_table(luato::CallFrame &frame)
+inline auto new_table(luato::CallFrame &frame,
+                      luato::TableCapacity capacity = {})
     -> rstd::Result<luato::TableHandle, luato::Error> {
-  auto value = frame.new_table();
-  if (value.is_err())
-    return Err(rstd::move(value).unwrap_err());
-  auto handle = take_lua_value(*value);
-  if (!handle.is_Table())
-    return Err(luato::Error::make(luato::ErrorKind::Binding, String::make(),
-                                  String::make("expected a new table"_str)));
-  return Ok(rstd::move(handle).as_Table().value);
+  return frame.create_table(capacity);
 }
-inline auto new_table(luato::State &state)
+inline auto new_table(luato::State &state, luato::TableCapacity capacity = {})
     -> rstd::Result<luato::TableHandle, luato::Error> {
-  return state.create_table();
+  return state.create_table(capacity);
 }
 inline auto table_arg(luato::CallFrame &frame, usize index)
     -> rstd::Result<luato::TableHandle, luato::Error> {

@@ -4,6 +4,7 @@ import luato.extra;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
+using rstd::time::Instant;
 
 namespace json_serde_tests {
 struct Request {
@@ -32,6 +33,59 @@ auto matches(const luato::LuaValue &value, const luato::TableHandle &marker)
   auto table = value.as_Table().value.clone().unwrap();
   auto meta = table.metatable().unwrap();
   return meta.is_some() && meta->same_object(marker).unwrap();
+}
+void check_batch_release(bool direct) {
+  String text = "["_Str;
+  for (unsigned i = 0; i < 512; ++i) {
+    if (i != 0)
+      text.push_ascii(',');
+    text.push_str(
+        R"({"name":"track","album":{"name":"album","year":2026},"artists":[{"name":"one"},{"name":"two"}],"duration":180000,"optional":null})"_str);
+  }
+  text.push_ascii(']');
+  for (bool generational : {false, true}) {
+    auto vm = state();
+    auto context = luato::extra::JsonContext::create(vm).unwrap();
+    if (generational)
+      ASSERT_TRUE(vm.execute_entry(source("collectgarbage('generational')"_str))
+                      .is_ok());
+    ASSERT_TRUE(
+        vm.execute_entry(source("collectgarbage('collect')"_str)).is_ok());
+    auto baseline = vm.used_memory().unwrap();
+    usize held{};
+    auto start = Instant::now();
+    for (unsigned i = 0; i < 4; ++i) {
+      auto decode = [&]() -> luato::Result<luato::LuaValue> {
+        if (direct)
+          return context.decode(vm, text.as_str());
+        auto parsed = rstd::json::from_str(text.as_str());
+        if (parsed.is_err())
+          return Err(luato::extra::json_error(rstd::move(parsed).unwrap_err(),
+                                              "invalid JSON"_str));
+        return context.decode(vm, *parsed);
+      };
+      auto value = decode();
+      ASSERT_TRUE(value.is_ok());
+      EXPECT_EQ(value->as_Table().value.length().unwrap(), usize(512));
+      held = held.max(vm.used_memory().unwrap());
+    }
+    auto elapsed = start.elapsed().as_secs_f64();
+    auto released = vm.used_memory().unwrap();
+    ASSERT_TRUE(
+        vm
+            .execute_entry(source(
+                "collectgarbage('collect'); collectgarbage('collect')"_str))
+            .is_ok());
+    auto collected = vm.used_memory().unwrap();
+    EXPECT_LT(collected, baseline + usize(64 * 1024));
+    __builtin_printf("json batch path=%s gc=%s rows=512 repeats=4 seconds=%.6f "
+                     "baseline_bytes=%zu held_bytes=%zu released_bytes=%zu "
+                     "collected_bytes=%zu\n",
+                     direct ? "reader" : "dom",
+                     generational ? "generational" : "incremental", elapsed,
+                     baseline.to_primitive(), held.to_primitive(),
+                     released.to_primitive(), collected.to_primitive());
+  }
 }
 } // namespace json_serde_tests
 
@@ -213,4 +267,85 @@ TEST(LuatoExtraJsonSerde, RejectsExpiredAndForeignMarkerOwners) {
   EXPECT_TRUE(luato::to_value(state, rstd::json::Map{}, options).is_err());
   EXPECT_TRUE(
       luato::to_value(state, rstd::json::Value::Null(), options).is_err());
+}
+
+TEST(LuatoExtraJsonSerde,
+     TextDecodeMatchesParsedValuesWithoutChangingNumberOrNullSemantics) {
+  auto state = json_serde_tests::state();
+  auto context = luato::extra::JsonContext::create(state).unwrap();
+  for (auto text : {
+           "null"_str,
+           "true"_str,
+           "false"_str,
+           "-9223372036854775808"_str,
+           "9223372036854775807"_str,
+           "18446744073709551615"_str,
+           "-0.0"_str,
+           "1.25e-3"_str,
+           R"("a\u0000\u4e2d\ud83d\ude00\n" )"_str,
+           "[]"_str,
+           "{}"_str,
+           R"({"a":null,"items":[null,{},[],true,1.5],"object":{"x":"y"}})"_str,
+           R"({"a":1,"a":null,"b":null,"b":2})"_str,
+       }) {
+    auto parsed = rstd::json::from_str(text).unwrap();
+    for (bool null_as_nil : {false, true}) {
+      auto direct = context.decode(state, text, null_as_nil);
+      auto dom = context.decode(state, parsed, null_as_nil);
+      ASSERT_TRUE(direct.is_ok());
+      ASSERT_TRUE(dom.is_ok());
+      auto actual = context.encode(*direct, !null_as_nil, true);
+      auto expected = context.encode(*dom, !null_as_nil, true);
+      ASSERT_TRUE(actual.is_ok());
+      ASSERT_TRUE(expected.is_ok());
+      EXPECT_EQ(*actual, *expected);
+    }
+  }
+  auto reader = rstd::json::Reader(R"({"a":null,"a":1})"_str,
+                                   {.reject_duplicate_keys = true});
+  EXPECT_TRUE(
+      luato::extra::decode_json_reader(context, state, reader, usize(), true)
+          .is_err());
+}
+
+TEST(LuatoExtraJsonSerde,
+     CallFrameTextDecodeValidatesCompleteInputAndRecoversAfterErrors) {
+  auto state = json_serde_tests::state();
+  auto installed = luato::extra::install_utilities(state, "tools"_str).unwrap();
+  auto result = state.execute_entry(json_serde_tests::source(R"(
+local J, S = tools.json, tools.json.strict
+local invalid = {'', '{', '[1,]', '{"a":}', '{"a":1,}', '{}{}', 'true false',
+    '01', '1e400', '"\\uD800"', '"\\uDC00"', '"'..string.char(255)..'"'}
+for _, text in ipairs(invalid) do
+    assert(not pcall(J.decode, text))
+    assert(not pcall(S.decode, text))
+    assert(S.encode_canonical(S.decode('{"ok":[],"n":null}')) == '{"n":null,"ok":[]}')
+end
+assert(J.decode('{"a":1,"a":null}').a == nil)
+assert(J.decode('{"a":null,"a":2}').a == 2)
+assert(S.decode('{"a":1,"a":null}').a == S.null)
+assert(S.kind(S.decode('[]')) == 'array' and S.kind(S.decode('{}')) == 'object')
+assert(pcall(S.decode, string.rep('[',64)..'0'..string.rep(']',64)))
+assert(not pcall(S.decode, string.rep('[',65)..'0'..string.rep(']',65)))
+assert(not pcall(J.decode, string.rep('[',65)..'0'..string.rep(']',65)))
+collectgarbage('collect')
+local before = collectgarbage('count')
+for i=1,400 do
+    assert(not pcall(S.decode, '{"items":[{},[],{"x":"value"}],"bad":}'))
+    assert(not pcall(S.decode, '{"items":[{},[]]} trailing'))
+end
+collectgarbage('collect')
+collectgarbage('collect')
+assert(collectgarbage('count') - before < 128)
+assert(S.encode_canonical(S.decode('{"recovered":true}')) == '{"recovered":true}')
+)"_str));
+  ASSERT_TRUE(result.is_ok());
+}
+
+TEST(LuatoExtraJsonSerde, TextDecodeReleasesBatchAfterGc) {
+  json_serde_tests::check_batch_release(true);
+}
+
+TEST(LuatoExtraJsonSerde, ParsedDecodeReleasesBatchAfterGc) {
+  json_serde_tests::check_batch_release(false);
 }
